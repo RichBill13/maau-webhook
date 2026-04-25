@@ -153,6 +153,7 @@ app.get('/api/messages', (req, res) => {
 // Envoyer une réponse WhatsApp
 app.post('/api/reply', async (req, res) => {
   const { to, message, messageId } = req.body;
+  console.log('Tentative envoi réponse à:', to, 'Message:', message);
   
   try {
     const response = await fetch(
@@ -173,8 +174,8 @@ app.post('/api/reply', async (req, res) => {
     );
 
     const data = await response.json();
+    console.log('Réponse Meta:', JSON.stringify(data));
     
-    // Marquer le message comme traité
     const msg = messages.find(m => m.id === messageId);
     if (msg) {
       msg.statut = 'traite';
