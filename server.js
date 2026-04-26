@@ -35,7 +35,7 @@ function getDriveClient() {
 }
 
 // Mapping numéro WhatsApp → élève + matière + prof
-// METTEZ A JOUR avec vos vrais numéros (sans le +)
+// Ajoutez vos vrais numéros ici (sans le +)
 const ELEVES_MAPPING = {
   '237697251888': {
     nom: 'Alice_Morel',
@@ -43,10 +43,10 @@ const ELEVES_MAPPING = {
       default: { dossier: 'Maths_Prof_Kamga', prof: 'Prof_Kamga' }
     }
   },
-  '33687654321': {
+  '237600000000': {
     nom: 'Bruno_Tagne',
     matieres: {
-      default: { dossier: 'Maths_Prof_Kamga', prof: 'Prof_Kamga' }
+      default: { dossier: 'Anglais_Prof_Mballa', prof: 'Prof_Mballa' }
     }
   }
 };
@@ -55,7 +55,9 @@ const ELEVES_MAPPING = {
 async function findOrCreateFolder(drive, name, parentId) {
   const res = await drive.files.list({
     q: `name='${name}' and '${parentId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`,
-    fields: 'files(id, name)'
+    fields: 'files(id, name)',
+    supportsAllDrives: true,
+    includeItemsFromAllDrives: true
   });
 
   if (res.data.files.length > 0) {
@@ -68,7 +70,8 @@ async function findOrCreateFolder(drive, name, parentId) {
       mimeType: 'application/vnd.google-apps.folder',
       parents: [parentId]
     },
-    fields: 'id'
+    fields: 'id',
+    supportsAllDrives: true
   });
 
   return folder.data.id;
@@ -90,7 +93,8 @@ async function uploadToDrive(fileBuffer, fileName, mimeType, folderId) {
       mimeType,
       body: bufferStream
     },
-    fields: 'id, name, webViewLink'
+    fields: 'id, name, webViewLink',
+    supportsAllDrives: true
   });
 
   return res.data;
