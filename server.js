@@ -37,7 +37,7 @@ function getDriveClient() {
 // Mapping numéro WhatsApp → élève + matière + prof
 // METTEZ A JOUR avec vos vrais numéros (sans le +)
 const ELEVES_MAPPING = {
-  '33612345678': {
+  '237697251888': {
     nom: 'Alice_Morel',
     matieres: {
       default: { dossier: 'Maths_Prof_Kamga', prof: 'Prof_Kamga' }
