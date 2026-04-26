@@ -19,7 +19,6 @@ app.use((req, res, next) => {
 const VERIFY_TOKEN = 'maau_academy_webhook_2024';
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN || '';
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID || '';
-const DRIVE_FOLDER_ID = process.env.DRIVE_FOLDER_ID || '';
 const GOOGLE_SERVICE_ACCOUNT = process.env.GOOGLE_SERVICE_ACCOUNT || '';
 
 // ==================
@@ -116,6 +115,31 @@ async function downloadFromMeta(mediaId) {
   return { buffer, mimeType: urlData.mime_type };
 }
 
+// Trouver ou créer le dossier racine MAAU Academy (sans parent = racine du Drive bot)
+async function getRootFolder(drive) {
+  const res = await drive.files.list({
+    q: `name='MAAU_Academy' and 'root' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`,
+    fields: 'files(id, name)',
+    supportsAllDrives: true,
+    includeItemsFromAllDrives: true
+  });
+
+  if (res.data.files.length > 0) {
+    return res.data.files[0].id;
+  }
+
+  const folder = await drive.files.create({
+    requestBody: {
+      name: 'MAAU_Academy',
+      mimeType: 'application/vnd.google-apps.folder'
+    },
+    fields: 'id',
+    supportsAllDrives: true
+  });
+
+  return folder.data.id;
+}
+
 // Router le fichier vers le bon dossier Drive
 async function routeFileToDrive(from, fileName, fileBuffer, mimeType) {
   const drive = getDriveClient();
@@ -126,7 +150,8 @@ async function routeFileToDrive(from, fileName, fileBuffer, mimeType) {
 
   const today = new Date().toISOString().split('T')[0];
 
-  const elevesId = await findOrCreateFolder(drive, 'Eleves', DRIVE_FOLDER_ID);
+  const rootId = await getRootFolder(drive);
+  const elevesId = await findOrCreateFolder(drive, 'Eleves', rootId);
   const eleveId = await findOrCreateFolder(drive, eleveNom, elevesId);
   const matiereId = await findOrCreateFolder(drive, matiereDossier, eleveId);
   const dateId = await findOrCreateFolder(drive, today, matiereId);
