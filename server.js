@@ -1,8 +1,12 @@
 const express = require('express');
+const { google } = require('googleapis');
+const fetch = require('node-fetch');
+const stream = require('stream');
+
 const app = express();
 app.use(express.json());
 
-// CORS — autoriser toutes les origines
+// CORS
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -10,22 +14,127 @@ app.use((req, res, next) => {
   if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
 });
-// Token de vérification webhook (à garder secret)
+
+// Variables d'environnement
 const VERIFY_TOKEN = 'maau_academy_webhook_2024';
-
-// Token d'accès WhatsApp
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN || '';
-const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID || '990950227445636';
+const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID || '';
+const DRIVE_FOLDER_ID = process.env.DRIVE_FOLDER_ID || '';
+const GOOGLE_SERVICE_ACCOUNT = process.env.GOOGLE_SERVICE_ACCOUNT || '';
 
-// Stockage temporaire des messages (en mémoire)
-let messages = [];
+// ==================
+// GOOGLE DRIVE SETUP
+// ==================
+function getDriveClient() {
+  const credentials = JSON.parse(GOOGLE_SERVICE_ACCOUNT);
+  const auth = new google.auth.GoogleAuth({
+    credentials,
+    scopes: ['https://www.googleapis.com/auth/drive']
+  });
+  return google.drive({ version: 'v3', auth });
+}
 
-// Templates de réponse MAAU Academy
-const TEMPLATES = {
-  MSG07: "Bonjour [Prénom],\n\nNous avons bien pris en compte votre message.\n\nNous revenons vers vous dans les plus brefs délais avec les éléments nécessaires.\n\nMA-AU Academy 🌟",
-  MSG21: "Bonjour [Prénom],\n\nMerci pour votre retour.\n\nNous comprenons votre ressenti et restons attentifs à la situation.\n\nNotre objectif est d'assurer un accompagnement de qualité.\n\nMA-AU Academy 🌟",
-  MSG06: "Bonjour [Prénom],\n\nSuite à l'absence, nous vous proposons d'organiser une séance de rattrapage.\n\nJe vous invite à nous partager vos disponibilités.\n\nMA-AU Academy 🌟"
+// Mapping numéro WhatsApp → élève + matière + prof
+// METTEZ A JOUR avec vos vrais numéros (sans le +)
+const ELEVES_MAPPING = {
+  '33612345678': {
+    nom: 'Alice_Morel',
+    matieres: {
+      default: { dossier: 'Maths_Prof_Kamga', prof: 'Prof_Kamga' }
+    }
+  },
+  '33687654321': {
+    nom: 'Bruno_Tagne',
+    matieres: {
+      default: { dossier: 'Maths_Prof_Kamga', prof: 'Prof_Kamga' }
+    }
+  }
 };
+
+// Trouver ou créer un dossier dans Drive
+async function findOrCreateFolder(drive, name, parentId) {
+  const res = await drive.files.list({
+    q: `name='${name}' and '${parentId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`,
+    fields: 'files(id, name)'
+  });
+
+  if (res.data.files.length > 0) {
+    return res.data.files[0].id;
+  }
+
+  const folder = await drive.files.create({
+    requestBody: {
+      name,
+      mimeType: 'application/vnd.google-apps.folder',
+      parents: [parentId]
+    },
+    fields: 'id'
+  });
+
+  return folder.data.id;
+}
+
+// Upload fichier vers Drive
+async function uploadToDrive(fileBuffer, fileName, mimeType, folderId) {
+  const drive = getDriveClient();
+
+  const bufferStream = new stream.PassThrough();
+  bufferStream.end(fileBuffer);
+
+  const res = await drive.files.create({
+    requestBody: {
+      name: fileName,
+      parents: [folderId]
+    },
+    media: {
+      mimeType,
+      body: bufferStream
+    },
+    fields: 'id, name, webViewLink'
+  });
+
+  return res.data;
+}
+
+// Télécharger fichier depuis Meta
+async function downloadFromMeta(mediaId) {
+  const urlRes = await fetch(
+    `https://graph.facebook.com/v18.0/${mediaId}`,
+    { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` } }
+  );
+  const urlData = await urlRes.json();
+
+  const fileRes = await fetch(urlData.url, {
+    headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` }
+  });
+
+  const buffer = await fileRes.buffer();
+  return { buffer, mimeType: urlData.mime_type };
+}
+
+// Router le fichier vers le bon dossier Drive
+async function routeFileToDrive(from, fileName, fileBuffer, mimeType) {
+  const drive = getDriveClient();
+
+  const eleve = ELEVES_MAPPING[from];
+  const eleveNom = eleve ? eleve.nom : `Inconnu_${from}`;
+  const matiereDossier = eleve ? eleve.matieres.default.dossier : 'Non_Assigne';
+
+  const today = new Date().toISOString().split('T')[0];
+
+  const elevesId = await findOrCreateFolder(drive, 'Eleves', DRIVE_FOLDER_ID);
+  const eleveId = await findOrCreateFolder(drive, eleveNom, elevesId);
+  const matiereId = await findOrCreateFolder(drive, matiereDossier, eleveId);
+  const dateId = await findOrCreateFolder(drive, today, matiereId);
+
+  const uploaded = await uploadToDrive(fileBuffer, fileName, mimeType, dateId);
+
+  console.log(`Fichier uploadé : ${uploaded.name} → ${uploaded.webViewLink}`);
+  return uploaded;
+}
+
+// Stockage temporaire des messages
+let messages = [];
 
 // ==================
 // WEBHOOK VERIFICATION
@@ -46,49 +155,71 @@ app.get('/webhook', (req, res) => {
 // ==================
 // RECEPTION MESSAGES
 // ==================
-app.post('/webhook', (req, res) => {
+app.post('/webhook', async (req, res) => {
   const body = req.body;
 
   if (body.object === 'whatsapp_business_account') {
-    body.entry?.forEach(entry => {
-      entry.changes?.forEach(change => {
+    for (const entry of body.entry || []) {
+      for (const change of entry.changes || []) {
         const value = change.value;
-        
-        // Message reçu
+
         if (value.messages) {
-          value.messages.forEach(msg => {
+          for (const msg of value.messages) {
             const from = msg.from;
             const messageId = msg.id;
             const timestamp = new Date(parseInt(msg.timestamp) * 1000);
-            
-            let content = '';
-            let type = 'text';
-            
-            if (msg.type === 'text') {
-              content = msg.text?.body || '';
-              type = 'text';
-            } else if (msg.type === 'audio') {
-              content = '[Note vocale reçue]';
-              type = 'audio';
-            } else if (msg.type === 'image') {
-              content = '[Image reçue]';
-              type = 'image';
-            } else if (msg.type === 'document') {
-              content = '[Document reçu: ' + (msg.document?.filename || 'fichier') + ']';
-              type = 'document';
-            } else {
-              content = '[Message de type: ' + msg.type + ']';
-              type = msg.type;
-            }
 
-            // Récupérer le nom du contact
             const contact = value.contacts?.find(c => c.wa_id === from);
             const name = contact?.profile?.name || from;
 
-            // Classifier automatiquement
+            let content = '';
+            let type = msg.type;
+            let mediaId = null;
+            let fileName = null;
+            let mimeType = null;
+
+            if (msg.type === 'text') {
+              content = msg.text?.body || '';
+            } else if (msg.type === 'image') {
+              mediaId = msg.image?.id;
+              mimeType = msg.image?.mime_type || 'image/jpeg';
+              fileName = `image_${Date.now()}.jpg`;
+              content = '[Image reçue]';
+            } else if (msg.type === 'document') {
+              mediaId = msg.document?.id;
+              mimeType = msg.document?.mime_type || 'application/pdf';
+              fileName = msg.document?.filename || `document_${Date.now()}.pdf`;
+              content = `[Document reçu: ${fileName}]`;
+            } else if (msg.type === 'audio') {
+              mediaId = msg.audio?.id;
+              mimeType = msg.audio?.mime_type || 'audio/ogg';
+              fileName = `audio_${Date.now()}.ogg`;
+              content = '[Note vocale reçue]';
+            } else if (msg.type === 'video') {
+              mediaId = msg.video?.id;
+              mimeType = msg.video?.mime_type || 'video/mp4';
+              fileName = `video_${Date.now()}.mp4`;
+              content = '[Vidéo reçue]';
+            } else {
+              content = `[Message de type: ${msg.type}]`;
+            }
+
+            // Upload vers Drive si fichier
+            let driveLink = null;
+            if (mediaId) {
+              try {
+                const { buffer } = await downloadFromMeta(mediaId);
+                const uploaded = await routeFileToDrive(from, fileName, buffer, mimeType);
+                driveLink = uploaded.webViewLink;
+                content += ` → Drive: ${driveLink}`;
+              } catch (err) {
+                console.error('Erreur upload Drive:', err.message);
+              }
+            }
+
             const categorie = classifyMessage(content);
 
-            const newMessage = {
+            messages.push({
               id: Date.now(),
               messageId,
               from,
@@ -99,62 +230,43 @@ app.post('/webhook', (req, res) => {
               timestamp,
               statut: 'non-traite',
               assignedTo: '',
-              reponse: ''
-            };
+              reponse: '',
+              driveLink
+            });
 
-            messages.push(newMessage);
-            console.log('Nouveau message reçu de:', name, '(', from, '):', content);
-          });
+            console.log(`Message de ${name} (${from}): ${content}`);
+          }
         }
-      });
-    });
+      }
+    }
   }
 
   res.sendStatus(200);
 });
 
 // ==================
-// CLASSIFICATION AUTOMATIQUE
+// CLASSIFICATION
 // ==================
 function classifyMessage(content) {
   const lower = content.toLowerCase();
-  
-  if (lower.includes('urgent') || lower.includes('problème') || lower.includes('aide') || lower.includes('ne fonctionne pas') || lower.includes('bloqué')) {
-    return 'urgent';
-  }
-  if (lower.includes('paiement') || lower.includes('facture') || lower.includes('payer') || lower.includes('tarif') || lower.includes('prix')) {
-    return 'financier';
-  }
-  if (lower.includes('cours') || lower.includes('séance') || lower.includes('rattrapage') || lower.includes('absent') || lower.includes('horaire')) {
-    return 'pedagogique';
-  }
-  if (lower.includes('connexion') || lower.includes('meet') || lower.includes('lien') || lower.includes('technique') || lower.includes('application')) {
-    return 'operationnel';
-  }
-  if (lower.includes('annul') || lower.includes('règle') || lower.includes('contrat')) {
-    return 'cadre';
-  }
-  if (lower.includes('mécontent') || lower.includes('insatisfait') || lower.includes('plainte') || lower.includes('problème')) {
-    return 'relation';
-  }
-  
+  if (lower.includes('urgent') || lower.includes('problème') || lower.includes('aide') || lower.includes('bloqué')) return 'urgent';
+  if (lower.includes('paiement') || lower.includes('facture') || lower.includes('payer') || lower.includes('tarif')) return 'financier';
+  if (lower.includes('cours') || lower.includes('séance') || lower.includes('rattrapage') || lower.includes('absent')) return 'pedagogique';
+  if (lower.includes('connexion') || lower.includes('meet') || lower.includes('lien') || lower.includes('technique')) return 'operationnel';
+  if (lower.includes('annul') || lower.includes('contrat')) return 'cadre';
+  if (lower.includes('mécontent') || lower.includes('insatisfait') || lower.includes('plainte')) return 'relation';
   return 'commercial';
 }
 
 // ==================
-// API POUR LE TABLEAU DE BORD
+// API TABLEAU DE BORD
 // ==================
-
-// Récupérer tous les messages
 app.get('/api/messages', (req, res) => {
   res.json({ success: true, messages });
 });
 
-// Envoyer une réponse WhatsApp
 app.post('/api/reply', async (req, res) => {
   const { to, message, messageId } = req.body;
-  console.log('Tentative envoi réponse à:', to, 'Message:', message);
-  
   try {
     const response = await fetch(
       `https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`,
@@ -166,62 +278,36 @@ app.post('/api/reply', async (req, res) => {
         },
         body: JSON.stringify({
           messaging_product: 'whatsapp',
-          to: to,
+          to,
           type: 'text',
           text: { body: message }
         })
       }
     );
-
     const data = await response.json();
-    console.log('Réponse Meta:', JSON.stringify(data));
-    
     const msg = messages.find(m => m.id === messageId);
-    if (msg) {
-      msg.statut = 'traite';
-      msg.reponse = message;
-    }
-
+    if (msg) { msg.statut = 'traite'; msg.reponse = message; }
     res.json({ success: true, data });
   } catch (error) {
-    console.error('Erreur envoi message:', error);
     res.json({ success: false, error: error.message });
   }
 });
 
-// Marquer comme traité
 app.post('/api/messages/:id/done', (req, res) => {
   const msg = messages.find(m => m.id === parseInt(req.params.id));
-  if (msg) {
-    msg.statut = 'traite';
-    msg.assignedTo = req.body.assignedTo || '';
-    res.json({ success: true });
-  } else {
-    res.json({ success: false, error: 'Message non trouvé' });
-  }
+  if (msg) { msg.statut = 'traite'; msg.assignedTo = req.body.assignedTo || ''; res.json({ success: true }); }
+  else res.json({ success: false, error: 'Message non trouvé' });
 });
 
-// Assigner un message
 app.post('/api/messages/:id/assign', (req, res) => {
   const msg = messages.find(m => m.id === parseInt(req.params.id));
-  if (msg) {
-    msg.assignedTo = req.body.assignedTo;
-    res.json({ success: true });
-  } else {
-    res.json({ success: false, error: 'Message non trouvé' });
-  }
+  if (msg) { msg.assignedTo = req.body.assignedTo; res.json({ success: true }); }
+  else res.json({ success: false, error: 'Message non trouvé' });
 });
 
-// Health check
 app.get('/', (req, res) => {
-  res.json({ 
-    status: 'MAAU Academy Webhook actif',
-    messages: messages.length,
-    timestamp: new Date()
-  });
+  res.json({ status: 'MAAU Academy Webhook actif', messages: messages.length, timestamp: new Date() });
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Serveur MAAU Academy démarré sur le port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Serveur MAAU Academy démarré sur le port ${PORT}`));
