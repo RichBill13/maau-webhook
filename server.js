@@ -19,22 +19,24 @@ app.use((req, res, next) => {
 const VERIFY_TOKEN = 'maau_academy_webhook_2024';
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN || '';
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID || '';
-const GOOGLE_SERVICE_ACCOUNT = process.env.GOOGLE_SERVICE_ACCOUNT || '';
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || '';
+const GOOGLE_REFRESH_TOKEN = process.env.GOOGLE_REFRESH_TOKEN || '';
 
 // ==================
-// GOOGLE DRIVE SETUP
+// GOOGLE DRIVE SETUP (OAuth2)
 // ==================
 function getDriveClient() {
-  const credentials = JSON.parse(GOOGLE_SERVICE_ACCOUNT);
-  const auth = new google.auth.GoogleAuth({
-    credentials,
-    scopes: ['https://www.googleapis.com/auth/drive']
-  });
-  return google.drive({ version: 'v3', auth });
+  const oauth2Client = new google.auth.OAuth2(
+    GOOGLE_CLIENT_ID,
+    GOOGLE_CLIENT_SECRET,
+    'https://developers.google.com/oauthplayground'
+  );
+  oauth2Client.setCredentials({ refresh_token: GOOGLE_REFRESH_TOKEN });
+  return google.drive({ version: 'v3', auth: oauth2Client });
 }
 
 // Mapping numéro WhatsApp → élève + matière + prof
-// Ajoutez vos vrais numéros ici (sans le +)
 const ELEVES_MAPPING = {
   '237697251888': {
     nom: 'Alice_Morel',
@@ -52,48 +54,31 @@ const ELEVES_MAPPING = {
 
 // Trouver ou créer un dossier dans Drive
 async function findOrCreateFolder(drive, name, parentId) {
-  const res = await drive.files.list({
-    q: `name='${name}' and '${parentId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`,
-    fields: 'files(id, name)',
-    supportsAllDrives: true,
-    includeItemsFromAllDrives: true
-  });
+  const q = parentId
+    ? `name='${name}' and '${parentId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`
+    : `name='${name}' and 'root' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`;
 
-  if (res.data.files.length > 0) {
-    return res.data.files[0].id;
-  }
+  const res = await drive.files.list({ q, fields: 'files(id, name)' });
 
-  const folder = await drive.files.create({
-    requestBody: {
-      name,
-      mimeType: 'application/vnd.google-apps.folder',
-      parents: [parentId]
-    },
-    fields: 'id',
-    supportsAllDrives: true
-  });
+  if (res.data.files.length > 0) return res.data.files[0].id;
 
+  const body = { name, mimeType: 'application/vnd.google-apps.folder' };
+  if (parentId) body.parents = [parentId];
+
+  const folder = await drive.files.create({ requestBody: body, fields: 'id' });
   return folder.data.id;
 }
 
 // Upload fichier vers Drive
 async function uploadToDrive(fileBuffer, fileName, mimeType, folderId) {
   const drive = getDriveClient();
-
   const bufferStream = new stream.PassThrough();
   bufferStream.end(fileBuffer);
 
   const res = await drive.files.create({
-    requestBody: {
-      name: fileName,
-      parents: [folderId]
-    },
-    media: {
-      mimeType,
-      body: bufferStream
-    },
-    fields: 'id, name, webViewLink',
-    supportsAllDrives: true
+    requestBody: { name: fileName, parents: [folderId] },
+    media: { mimeType, body: bufferStream },
+    fields: 'id, name, webViewLink'
   });
 
   return res.data;
@@ -106,38 +91,11 @@ async function downloadFromMeta(mediaId) {
     { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` } }
   );
   const urlData = await urlRes.json();
-
   const fileRes = await fetch(urlData.url, {
     headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` }
   });
-
   const buffer = await fileRes.buffer();
   return { buffer, mimeType: urlData.mime_type };
-}
-
-// Trouver ou créer le dossier racine MAAU Academy (sans parent = racine du Drive bot)
-async function getRootFolder(drive) {
-  const res = await drive.files.list({
-    q: `name='MAAU_Academy' and 'root' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`,
-    fields: 'files(id, name)',
-    supportsAllDrives: true,
-    includeItemsFromAllDrives: true
-  });
-
-  if (res.data.files.length > 0) {
-    return res.data.files[0].id;
-  }
-
-  const folder = await drive.files.create({
-    requestBody: {
-      name: 'MAAU_Academy',
-      mimeType: 'application/vnd.google-apps.folder'
-    },
-    fields: 'id',
-    supportsAllDrives: true
-  });
-
-  return folder.data.id;
 }
 
 // Router le fichier vers le bon dossier Drive
@@ -147,17 +105,15 @@ async function routeFileToDrive(from, fileName, fileBuffer, mimeType) {
   const eleve = ELEVES_MAPPING[from];
   const eleveNom = eleve ? eleve.nom : `Inconnu_${from}`;
   const matiereDossier = eleve ? eleve.matieres.default.dossier : 'Non_Assigne';
-
   const today = new Date().toISOString().split('T')[0];
 
-  const rootId = await getRootFolder(drive);
+  const rootId = await findOrCreateFolder(drive, 'MAAU_Academy', null);
   const elevesId = await findOrCreateFolder(drive, 'Eleves', rootId);
   const eleveId = await findOrCreateFolder(drive, eleveNom, elevesId);
   const matiereId = await findOrCreateFolder(drive, matiereDossier, eleveId);
   const dateId = await findOrCreateFolder(drive, today, matiereId);
 
   const uploaded = await uploadToDrive(fileBuffer, fileName, mimeType, dateId);
-
   console.log(`Fichier uploadé : ${uploaded.name} → ${uploaded.webViewLink}`);
   return uploaded;
 }
@@ -172,9 +128,8 @@ app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
-
   if (mode === 'subscribe' && token === VERIFY_TOKEN) {
-    console.log('Webhook vérifié avec succès');
+    console.log('Webhook vérifié');
     res.status(200).send(challenge);
   } else {
     res.sendStatus(403);
@@ -191,13 +146,11 @@ app.post('/webhook', async (req, res) => {
     for (const entry of body.entry || []) {
       for (const change of entry.changes || []) {
         const value = change.value;
-
         if (value.messages) {
           for (const msg of value.messages) {
             const from = msg.from;
             const messageId = msg.id;
             const timestamp = new Date(parseInt(msg.timestamp) * 1000);
-
             const contact = value.contacts?.find(c => c.wa_id === from);
             const name = contact?.profile?.name || from;
 
@@ -233,7 +186,6 @@ app.post('/webhook', async (req, res) => {
               content = `[Message de type: ${msg.type}]`;
             }
 
-            // Upload vers Drive si fichier
             let driveLink = null;
             if (mediaId) {
               try {
@@ -247,29 +199,17 @@ app.post('/webhook', async (req, res) => {
             }
 
             const categorie = classifyMessage(content);
-
             messages.push({
-              id: Date.now(),
-              messageId,
-              from,
-              name,
-              content,
-              type,
-              categorie,
-              timestamp,
-              statut: 'non-traite',
-              assignedTo: '',
-              reponse: '',
-              driveLink
+              id: Date.now(), messageId, from, name, content, type,
+              categorie, timestamp, statut: 'non-traite',
+              assignedTo: '', reponse: '', driveLink
             });
-
             console.log(`Message de ${name} (${from}): ${content}`);
           }
         }
       }
     }
   }
-
   res.sendStatus(200);
 });
 
@@ -301,16 +241,8 @@ app.post('/api/reply', async (req, res) => {
       `https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`,
       {
         method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${WHATSAPP_TOKEN}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          messaging_product: 'whatsapp',
-          to,
-          type: 'text',
-          text: { body: message }
-        })
+        headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messaging_product: 'whatsapp', to, type: 'text', text: { body: message } })
       }
     );
     const data = await response.json();
