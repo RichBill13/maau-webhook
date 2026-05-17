@@ -16,13 +16,15 @@ app.use((req, res, next) => {
 });
 
 // Variables d'environnement
-const VERIFY_TOKEN = 'maau_academy_webhook_2024';
-const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN || '';
-const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID || '';
-const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
+const VERIFY_TOKEN       = 'maau_academy_webhook_2024';
+const WHATSAPP_TOKEN     = process.env.WHATSAPP_TOKEN || '';
+const PHONE_NUMBER_ID    = process.env.PHONE_NUMBER_ID || '';
+const GOOGLE_CLIENT_ID   = process.env.GOOGLE_CLIENT_ID || '';
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || '';
 const GOOGLE_REFRESH_TOKEN = process.env.GOOGLE_REFRESH_TOKEN || '';
-const N8N_SECRET = process.env.N8N_SECRET || '';
+const N8N_SECRET         = process.env.N8N_SECRET || '';
+const GREEN_API_INSTANCE = process.env.GREEN_API_INSTANCE || '7107622536';
+const GREEN_API_TOKEN    = process.env.GREEN_API_TOKEN || '';
 
 // ==================
 // GOOGLE DRIVE SETUP (OAuth2)
@@ -84,20 +86,28 @@ async function downloadFromMeta(mediaId) {
   return { buffer, mimeType: urlData.mime_type };
 }
 
-// Router le fichier vers le bon dossier Drive — logique par groupe WhatsApp
+// Router le fichier vers le bon dossier Drive
 // Structure : MAAU_Academy / Groupes / [nom du groupe] / [date] / fichier
-async function routeFileToDrive(sender, fileName, fileBuffer, mimeType, chatName) {
+//             MAAU_Academy / Individuels / [nom] / [date] / fichier
+async function routeFileToDrive(sender, fileName, fileBuffer, mimeType, chatName, isGroup) {
   const drive = getDriveClient();
-
-  const groupeName = chatName && chatName.trim() !== '' ? chatName : `Inconnu_${sender}`;
   const today = new Date().toISOString().split('T')[0];
+  const rootId = await findOrCreateFolder(drive, 'MAAU_Academy', null);
 
-  const rootId    = await findOrCreateFolder(drive, 'MAAU_Academy', null);
-  const groupesId = await findOrCreateFolder(drive, 'Groupes', rootId);
-  const groupeId  = await findOrCreateFolder(drive, groupeName, groupesId);
-  const dateId    = await findOrCreateFolder(drive, today, groupeId);
+  let parentId;
+  if (isGroup) {
+    const groupeName = chatName && chatName.trim() !== '' ? chatName : `Groupe_Inconnu`;
+    const groupesId  = await findOrCreateFolder(drive, 'Groupes', rootId);
+    const groupeId   = await findOrCreateFolder(drive, groupeName, groupesId);
+    parentId         = await findOrCreateFolder(drive, today, groupeId);
+  } else {
+    const nomDossier   = chatName && chatName.trim() !== '' ? chatName : `Inconnu_${sender}`;
+    const indivId      = await findOrCreateFolder(drive, 'Individuels', rootId);
+    const personneId   = await findOrCreateFolder(drive, nomDossier, indivId);
+    parentId           = await findOrCreateFolder(drive, today, personneId);
+  }
 
-  const uploaded = await uploadToDrive(fileBuffer, fileName, mimeType, dateId);
+  const uploaded = await uploadToDrive(fileBuffer, fileName, mimeType, parentId);
   console.log(`Fichier uploadé : ${uploaded.name} → ${uploaded.webViewLink}`);
   return uploaded;
 }
@@ -109,8 +119,8 @@ let messages = [];
 // WEBHOOK VERIFICATION (Meta)
 // ==================
 app.get('/webhook', (req, res) => {
-  const mode = req.query['hub.mode'];
-  const token = req.query['hub.verify_token'];
+  const mode      = req.query['hub.mode'];
+  const token     = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
   if (mode === 'subscribe' && token === VERIFY_TOKEN) {
     console.log('Webhook vérifié');
@@ -132,40 +142,40 @@ app.post('/webhook', async (req, res) => {
         const value = change.value;
         if (value.messages) {
           for (const msg of value.messages) {
-            const from = msg.from;
+            const from      = msg.from;
             const messageId = msg.id;
             const timestamp = new Date(parseInt(msg.timestamp) * 1000);
-            const contact = value.contacts?.find(c => c.wa_id === from);
-            const name = contact?.profile?.name || from;
+            const contact   = value.contacts?.find(c => c.wa_id === from);
+            const name      = contact?.profile?.name || from;
 
-            let content = '';
-            let type = msg.type;
-            let mediaId = null;
+            let content  = '';
+            let type     = msg.type;
+            let mediaId  = null;
             let fileName = null;
             let mimeType = null;
 
             if (msg.type === 'text') {
               content = msg.text?.body || '';
             } else if (msg.type === 'image') {
-              mediaId = msg.image?.id;
+              mediaId  = msg.image?.id;
               mimeType = msg.image?.mime_type || 'image/jpeg';
               fileName = `image_${Date.now()}.jpg`;
-              content = '[Image reçue]';
+              content  = '[Image reçue]';
             } else if (msg.type === 'document') {
-              mediaId = msg.document?.id;
+              mediaId  = msg.document?.id;
               mimeType = msg.document?.mime_type || 'application/pdf';
               fileName = msg.document?.filename || `document_${Date.now()}.pdf`;
-              content = `[Document reçu: ${fileName}]`;
+              content  = `[Document reçu: ${fileName}]`;
             } else if (msg.type === 'audio') {
-              mediaId = msg.audio?.id;
+              mediaId  = msg.audio?.id;
               mimeType = msg.audio?.mime_type || 'audio/ogg';
               fileName = `audio_${Date.now()}.ogg`;
-              content = '[Note vocale reçue]';
+              content  = '[Note vocale reçue]';
             } else if (msg.type === 'video') {
-              mediaId = msg.video?.id;
+              mediaId  = msg.video?.id;
               mimeType = msg.video?.mime_type || 'video/mp4';
               fileName = `video_${Date.now()}.mp4`;
-              content = '[Vidéo reçue]';
+              content  = '[Vidéo reçue]';
             } else {
               content = `[Message de type: ${msg.type}]`;
             }
@@ -174,9 +184,9 @@ app.post('/webhook', async (req, res) => {
             if (mediaId) {
               try {
                 const { buffer } = await downloadFromMeta(mediaId);
-                const uploaded = await routeFileToDrive(from, fileName, buffer, mimeType, '');
-                driveLink = uploaded.webViewLink;
-                content += ` → Drive: ${driveLink}`;
+                const uploaded   = await routeFileToDrive(from, fileName, buffer, mimeType, '', false);
+                driveLink        = uploaded.webViewLink;
+                content         += ` → Drive: ${driveLink}`;
               } catch (err) {
                 console.error('Erreur upload Drive:', err.message);
               }
@@ -269,13 +279,12 @@ app.post('/api/n8n/message', async (req, res) => {
     type    = msgType;
   }
 
-  // Upload vers Google Drive avec logique par groupe
   let driveLink = null;
   if (mediaUrl) {
     try {
       const response = await fetch(mediaUrl);
       const buffer   = await response.buffer();
-      const uploaded = await routeFileToDrive(sender, fileName, buffer, mimeType, chatName);
+      const uploaded = await routeFileToDrive(sender, fileName, buffer, mimeType, chatName, isGroup);
       driveLink      = uploaded.webViewLink;
       content       += ` → Drive: ${driveLink}`;
       console.log(`[n8n] Fichier de ${name} dans "${chatName}" uploadé: ${driveLink}`);
@@ -332,22 +341,33 @@ app.get('/api/messages', (req, res) => {
   res.json({ success: true, messages });
 });
 
+// Répondre via Green API (groupes et conversations individuelles)
 app.post('/api/reply', async (req, res) => {
-  const { to, message, messageId } = req.body;
+  const { chatId, message, messageId } = req.body;
+
+  if (!chatId || !message) {
+    return res.status(400).json({ success: false, error: 'chatId et message requis' });
+  }
+
   try {
-    const response = await fetch(
-      `https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`,
-      {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messaging_product: 'whatsapp', to, type: 'text', text: { body: message } })
-      }
-    );
+    const url = `https://7107.api.greenapi.com/waInstance${GREEN_API_INSTANCE}/sendMessage/${GREEN_API_TOKEN}`;
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chatId, message })
+    });
+
     const data = await response.json();
+
     const msg = messages.find(m => m.id === messageId);
     if (msg) { msg.statut = 'traite'; msg.reponse = message; }
+
+    console.log(`[Reply] Message envoyé vers ${chatId}: ${message}`);
     res.json({ success: true, data });
+
   } catch (error) {
+    console.error('[Reply] Erreur:', error.message);
     res.json({ success: false, error: error.message });
   }
 });
