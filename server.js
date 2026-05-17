@@ -37,33 +37,18 @@ function getDriveClient() {
   return google.drive({ version: 'v3', auth: oauth2Client });
 }
 
-// Mapping numéro WhatsApp → élève + matière + prof
-const ELEVES_MAPPING = {
-  '237697251888': {
-    nom: 'Alice_Morel',
-    matieres: {
-      default: { dossier: 'Maths_Prof_Kamga', prof: 'Prof_Kamga' }
-    }
-  },
-  '237600000000': {
-    nom: 'Bruno_Tagne',
-    matieres: {
-      default: { dossier: 'Anglais_Prof_Mballa', prof: 'Prof_Mballa' }
-    }
-  }
-};
-
 // Trouver ou créer un dossier dans Drive
 async function findOrCreateFolder(drive, name, parentId) {
+  const safeName = name.replace(/['"\\]/g, '_');
   const q = parentId
-    ? `name='${name}' and '${parentId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`
-    : `name='${name}' and 'root' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`;
+    ? `name='${safeName}' and '${parentId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`
+    : `name='${safeName}' and 'root' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`;
 
   const res = await drive.files.list({ q, fields: 'files(id, name)' });
 
   if (res.data.files.length > 0) return res.data.files[0].id;
 
-  const body = { name, mimeType: 'application/vnd.google-apps.folder' };
+  const body = { name: safeName, mimeType: 'application/vnd.google-apps.folder' };
   if (parentId) body.parents = [parentId];
 
   const folder = await drive.files.create({ requestBody: body, fields: 'id' });
@@ -99,20 +84,18 @@ async function downloadFromMeta(mediaId) {
   return { buffer, mimeType: urlData.mime_type };
 }
 
-// Router le fichier vers le bon dossier Drive
-async function routeFileToDrive(from, fileName, fileBuffer, mimeType) {
+// Router le fichier vers le bon dossier Drive — logique par groupe WhatsApp
+// Structure : MAAU_Academy / Groupes / [nom du groupe] / [date] / fichier
+async function routeFileToDrive(sender, fileName, fileBuffer, mimeType, chatName) {
   const drive = getDriveClient();
 
-  const eleve = ELEVES_MAPPING[from];
-  const eleveNom = eleve ? eleve.nom : `Inconnu_${from}`;
-  const matiereDossier = eleve ? eleve.matieres.default.dossier : 'Non_Assigne';
+  const groupeName = chatName && chatName.trim() !== '' ? chatName : `Inconnu_${sender}`;
   const today = new Date().toISOString().split('T')[0];
 
-  const rootId = await findOrCreateFolder(drive, 'MAAU_Academy', null);
-  const elevesId = await findOrCreateFolder(drive, 'Eleves', rootId);
-  const eleveId = await findOrCreateFolder(drive, eleveNom, elevesId);
-  const matiereId = await findOrCreateFolder(drive, matiereDossier, eleveId);
-  const dateId = await findOrCreateFolder(drive, today, matiereId);
+  const rootId    = await findOrCreateFolder(drive, 'MAAU_Academy', null);
+  const groupesId = await findOrCreateFolder(drive, 'Groupes', rootId);
+  const groupeId  = await findOrCreateFolder(drive, groupeName, groupesId);
+  const dateId    = await findOrCreateFolder(drive, today, groupeId);
 
   const uploaded = await uploadToDrive(fileBuffer, fileName, mimeType, dateId);
   console.log(`Fichier uploadé : ${uploaded.name} → ${uploaded.webViewLink}`);
@@ -191,7 +174,7 @@ app.post('/webhook', async (req, res) => {
             if (mediaId) {
               try {
                 const { buffer } = await downloadFromMeta(mediaId);
-                const uploaded = await routeFileToDrive(from, fileName, buffer, mimeType);
+                const uploaded = await routeFileToDrive(from, fileName, buffer, mimeType, '');
                 driveLink = uploaded.webViewLink;
                 content += ` → Drive: ${driveLink}`;
               } catch (err) {
@@ -216,11 +199,10 @@ app.post('/webhook', async (req, res) => {
 });
 
 // ==================
-// ENDPOINT N8N / GREEN API / WAHA
+// ENDPOINT N8N / GREEN API
 // ==================
 app.post('/api/n8n/message', async (req, res) => {
 
-  // Vérification clé API
   if (N8N_SECRET && req.headers['x-api-key'] !== N8N_SECRET) {
     console.log('Tentative non autorisée sur /api/n8n/message');
     return res.status(401).json({ success: false, error: 'Non autorisé' });
@@ -228,7 +210,6 @@ app.post('/api/n8n/message', async (req, res) => {
 
   const body = req.body;
 
-  // Ignorer les webhooks qui ne sont pas des messages entrants
   if (body.typeWebhook && body.typeWebhook !== 'incomingMessageReceived') {
     return res.status(200).json({ success: true, ignored: true });
   }
@@ -236,14 +217,12 @@ app.post('/api/n8n/message', async (req, res) => {
   const senderData  = body.senderData || {};
   const messageData = body.messageData || {};
 
-  // Extraire les données expéditeur
   const chatId   = senderData.chatId || '';
   const sender   = senderData.sender?.replace('@c.us', '') || '';
   const name     = senderData.senderName || sender;
   const chatName = senderData.chatName || '';
   const isGroup  = chatId.includes('@g.us');
 
-  // Extraire le contenu du message
   let content  = '';
   let type     = 'text';
   let mediaUrl = null;
@@ -290,16 +269,16 @@ app.post('/api/n8n/message', async (req, res) => {
     type    = msgType;
   }
 
-  // Upload vers Google Drive si fichier avec URL
+  // Upload vers Google Drive avec logique par groupe
   let driveLink = null;
   if (mediaUrl) {
     try {
       const response = await fetch(mediaUrl);
       const buffer   = await response.buffer();
-      const uploaded = await routeFileToDrive(sender, fileName, buffer, mimeType);
+      const uploaded = await routeFileToDrive(sender, fileName, buffer, mimeType, chatName);
       driveLink      = uploaded.webViewLink;
       content       += ` → Drive: ${driveLink}`;
-      console.log(`[n8n] Fichier de ${name} uploadé: ${driveLink}`);
+      console.log(`[n8n] Fichier de ${name} dans "${chatName}" uploadé: ${driveLink}`);
     } catch (err) {
       console.error('[n8n] Erreur upload Drive:', err.message);
     }
