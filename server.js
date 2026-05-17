@@ -10,7 +10,7 @@ app.use(express.json());
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-api-key');
   if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
 });
@@ -22,6 +22,7 @@ const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID || '';
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || '';
 const GOOGLE_REFRESH_TOKEN = process.env.GOOGLE_REFRESH_TOKEN || '';
+const N8N_SECRET = process.env.N8N_SECRET || '';
 
 // ==================
 // GOOGLE DRIVE SETUP (OAuth2)
@@ -122,7 +123,7 @@ async function routeFileToDrive(from, fileName, fileBuffer, mimeType) {
 let messages = [];
 
 // ==================
-// WEBHOOK VERIFICATION
+// WEBHOOK VERIFICATION (Meta)
 // ==================
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
@@ -137,7 +138,7 @@ app.get('/webhook', (req, res) => {
 });
 
 // ==================
-// RECEPTION MESSAGES
+// RECEPTION MESSAGES (Meta API officielle)
 // ==================
 app.post('/webhook', async (req, res) => {
   const body = req.body;
@@ -202,15 +203,133 @@ app.post('/webhook', async (req, res) => {
             messages.push({
               id: Date.now(), messageId, from, name, content, type,
               categorie, timestamp, statut: 'non-traite',
-              assignedTo: '', reponse: '', driveLink
+              assignedTo: '', reponse: '', driveLink,
+              source: 'meta'
             });
-            console.log(`Message de ${name} (${from}): ${content}`);
+            console.log(`[Meta] Message de ${name} (${from}): ${content}`);
           }
         }
       }
     }
   }
   res.sendStatus(200);
+});
+
+// ==================
+// ENDPOINT N8N / GREEN API / WAHA
+// ==================
+app.post('/api/n8n/message', async (req, res) => {
+
+  // Vérification clé API
+  if (N8N_SECRET && req.headers['x-api-key'] !== N8N_SECRET) {
+    console.log('Tentative non autorisée sur /api/n8n/message');
+    return res.status(401).json({ success: false, error: 'Non autorisé' });
+  }
+
+  const body = req.body;
+
+  // Ignorer les webhooks qui ne sont pas des messages entrants
+  if (body.typeWebhook && body.typeWebhook !== 'incomingMessageReceived') {
+    return res.status(200).json({ success: true, ignored: true });
+  }
+
+  const senderData  = body.senderData || {};
+  const messageData = body.messageData || {};
+
+  // Extraire les données expéditeur
+  const chatId   = senderData.chatId || '';
+  const sender   = senderData.sender?.replace('@c.us', '') || '';
+  const name     = senderData.senderName || sender;
+  const chatName = senderData.chatName || '';
+  const isGroup  = chatId.includes('@g.us');
+
+  // Extraire le contenu du message
+  let content  = '';
+  let type     = 'text';
+  let mediaUrl = null;
+  let fileName = null;
+  let mimeType = null;
+
+  const msgType = messageData.typeMessage || '';
+
+  if (msgType === 'textMessage') {
+    content = messageData.textMessageData?.textMessage || '';
+    type    = 'text';
+
+  } else if (msgType === 'imageMessage') {
+    content  = '[Image reçue]';
+    type     = 'image';
+    mediaUrl = messageData.fileMessageData?.downloadUrl || null;
+    fileName = `image_${Date.now()}.jpg`;
+    mimeType = 'image/jpeg';
+
+  } else if (msgType === 'documentMessage') {
+    const fileData = messageData.fileMessageData || {};
+    fileName = fileData.fileName || `document_${Date.now()}.pdf`;
+    mimeType = fileData.mimeType || 'application/pdf';
+    content  = `[Document reçu: ${fileName}]`;
+    type     = 'document';
+    mediaUrl = fileData.downloadUrl || null;
+
+  } else if (msgType === 'audioMessage') {
+    content  = '[Note vocale reçue]';
+    type     = 'audio';
+    mediaUrl = messageData.fileMessageData?.downloadUrl || null;
+    fileName = `audio_${Date.now()}.ogg`;
+    mimeType = 'audio/ogg';
+
+  } else if (msgType === 'videoMessage') {
+    content  = '[Vidéo reçue]';
+    type     = 'video';
+    mediaUrl = messageData.fileMessageData?.downloadUrl || null;
+    fileName = `video_${Date.now()}.mp4`;
+    mimeType = 'video/mp4';
+
+  } else {
+    content = `[Message de type: ${msgType}]`;
+    type    = msgType;
+  }
+
+  // Upload vers Google Drive si fichier avec URL
+  let driveLink = null;
+  if (mediaUrl) {
+    try {
+      const response = await fetch(mediaUrl);
+      const buffer   = await response.buffer();
+      const uploaded = await routeFileToDrive(sender, fileName, buffer, mimeType);
+      driveLink      = uploaded.webViewLink;
+      content       += ` → Drive: ${driveLink}`;
+      console.log(`[n8n] Fichier de ${name} uploadé: ${driveLink}`);
+    } catch (err) {
+      console.error('[n8n] Erreur upload Drive:', err.message);
+    }
+  }
+
+  const categorie = classifyMessage(content);
+
+  const newMessage = {
+    id         : Date.now(),
+    messageId  : `n8n_${Date.now()}`,
+    from       : sender,
+    name       : name,
+    chatId     : chatId,
+    chatName   : chatName,
+    isGroup    : isGroup,
+    content    : content,
+    type       : type,
+    categorie  : categorie,
+    timestamp  : new Date(),
+    statut     : 'non-traite',
+    assignedTo : '',
+    reponse    : '',
+    driveLink  : driveLink,
+    source     : 'n8n'
+  };
+
+  messages.push(newMessage);
+  console.log(`[n8n] Message de ${name} (${sender})${isGroup ? ` dans groupe "${chatName}"` : ''}: ${content}`);
+
+  res.json({ success: true, messageId: newMessage.id });
 });
 
 // ==================
